@@ -1,7 +1,5 @@
 # region imports
 from AlgorithmImports import *
-import json
-import sqlite3
 from datetime import timedelta
 import numpy as np
 # endregion
@@ -29,6 +27,8 @@ class AdaptiveRSIPCAAlgorithm(QCAlgorithm):
         self.SetStartDate(2025, 8, 1)
         self.SetEndDate(2025, 12, 31)
         self.SetCash(100000)
+        
+        # Set brokerage model
         self.SetBrokerageModel(BrokerageName.InteractiveBrokersBrokerage, AccountType.Margin)
         
         # Portfolio universe (validated tickers)
@@ -66,9 +66,9 @@ class AdaptiveRSIPCAAlgorithm(QCAlgorithm):
         for ticker, symbol in self.symbols.items():
             self.indicators[ticker] = {
                 'ema': self.EMA(symbol, self.ema_period, Resolution.Minute),
-                'rsi': self.RSI(symbol, self.rsi_period, Resolution.Minute)
+                'rsi': self.RSI(symbol, self.rsi_period, MovingAverageType.Wilders)
             }
-            self.price_windows[ticker] = RollingWindow[TradeBar](self.lookback_period * 10)  # 10-minute bars
+            self.price_windows[ticker] = RollingWindow[TradeBar](self.lookback_period * 10)
         
         # Position tracking
         self.positions = {}
@@ -82,6 +82,9 @@ class AdaptiveRSIPCAAlgorithm(QCAlgorithm):
         
         # Volatility calculation window
         self.volatility_window = 20  # Days for volatility calculation
+        
+        # Track last execution time for 10-minute bars
+        self.last_trade_time = {}
         
         # Schedule learning analysis
         self.Schedule.On(
@@ -101,9 +104,24 @@ class AdaptiveRSIPCAAlgorithm(QCAlgorithm):
             if data.ContainsKey(symbol) and data[symbol] is not None:
                 self.price_windows[ticker].Add(data[symbol])
         
-        # Execute trading logic (every 10 minutes to match validation)
-        if self.Time.minute % 10 == 0:
+        # Execute trading logic every 10 minutes
+        current_time = self.Time
+        
+        # Check if 10 minutes have passed since last execution for any symbol
+        should_execute = False
+        for ticker in self.tickers:
+            if ticker not in self.last_trade_time:
+                self.last_trade_time[ticker] = current_time
+                should_execute = True
+            elif (current_time - self.last_trade_time[ticker]).total_seconds() >= 600:  # 10 minutes
+                should_execute = True
+                break
+        
+        if should_execute:
             self.ExecuteTradingLogic(data)
+            # Update last execution time for all tickers
+            for ticker in self.tickers:
+                self.last_trade_time[ticker] = current_time
 
     def ExecuteTradingLogic(self, data):
         """Execute RSI-PCA trading logic with adaptive parameters"""
@@ -138,16 +156,18 @@ class AdaptiveRSIPCAAlgorithm(QCAlgorithm):
             return {"regime": "low", "volatility": 0, "atr_pct": 0}
         
         # Calculate recent volatility
-        prices = [bar.Close for bar in self.price_windows[ticker]][:self.volatility_window]
-        highs = [bar.High for bar in self.price_windows[ticker]][:self.volatility_window]
-        lows = [bar.Low for bar in self.price_windows[ticker]][:self.volatility_window]
+        window_list = list(self.price_windows[ticker])[:min(self.volatility_window, self.price_windows[ticker].Count)]
+        
+        prices = [bar.Close for bar in window_list]
+        highs = [bar.High for bar in window_list]
+        lows = [bar.Low for bar in window_list]
         
         # Intraday volatility calculation
         daily_ranges = []
         current_date = None
         day_high = day_low = day_close = 0
         
-        for i, bar in enumerate(list(self.price_windows[ticker])[:self.volatility_window]):
+        for bar in window_list:
             bar_date = bar.Time.date()
             
             if current_date != bar_date:
@@ -175,8 +195,8 @@ class AdaptiveRSIPCAAlgorithm(QCAlgorithm):
         # Simple ATR calculation
         atr_pct = 0
         if len(prices) > 14:
-            ranges = [(highs[i] - lows[i]) / prices[i] for i in range(min(14, len(prices)))]
-            atr_pct = np.mean(ranges) * 100
+            ranges = [(highs[i] - lows[i]) / prices[i] for i in range(min(14, len(prices))) if prices[i] > 0]
+            atr_pct = np.mean(ranges) * 100 if ranges else 0
         
         vol_threshold = self.adaptive_params['volatility_threshold']['value']
         regime = "high" if volatility_pct > vol_threshold else "low"
@@ -232,19 +252,21 @@ class AdaptiveRSIPCAAlgorithm(QCAlgorithm):
         ema_score = np.clip(ema_score * 20, -1.0, 1.0)
         
         # Price momentum
+        momentum_score = 0
         if self.price_windows[ticker].Count >= 6:
             recent_prices = [bar.Close for bar in list(self.price_windows[ticker])[:6]]
-            momentum = (current_price - recent_prices[-1]) / recent_prices[-1] if recent_prices[-1] > 0 else 0
-            momentum_score = np.clip(momentum * 20, -1.0, 1.0)
-        else:
-            momentum_score = 0
+            if recent_prices[-1] > 0:
+                momentum = (current_price - recent_prices[-1]) / recent_prices[-1]
+                momentum_score = np.clip(momentum * 20, -1.0, 1.0)
         
         # Volume confirmation (simplified for QuantConnect)
         volume_score = 0
-        if self.price_windows[ticker].Count >= 10:
-            recent_volume = np.mean([bar.Volume for bar in list(self.price_windows[ticker])[:5]])
-            avg_volume = np.mean([bar.Volume for bar in list(self.price_windows[ticker])[:20]])
-            if avg_volume > 0:
+        if self.price_windows[ticker].Count >= 20:
+            window_list = list(self.price_windows[ticker])
+            recent_volume = np.mean([bar.Volume for bar in window_list[:5]]) if len(window_list) >= 5 else 0
+            avg_volume = np.mean([bar.Volume for bar in window_list[:20]]) if len(window_list) >= 20 else 0
+            
+            if avg_volume > 0 and recent_volume > 0:
                 volume_ratio = recent_volume / avg_volume
                 if volume_ratio > 1.2:
                     volume_score = min((volume_ratio - 1) * 2, 0.5)
@@ -269,13 +291,13 @@ class AdaptiveRSIPCAAlgorithm(QCAlgorithm):
             # Calculate position size
             position_value = self.Portfolio.TotalPortfolioValue * self.base_position_size
             position_size = position_value * dynamic_params['position_multiplier']
-            quantity = int(position_size / current_price)
+            quantity = int(position_size / current_price) if current_price > 0 else 0
             
             if quantity > 0:
                 # Execute entry
                 ticket = self.MarketOrder(symbol, quantity)
                 
-                if ticket.Status == OrderStatus.Filled:
+                if ticket.Status == OrderStatus.Filled or ticket.Status == OrderStatus.PartiallyFilled:
                     self.positions[ticker] = quantity
                     self.entry_info[ticker] = {
                         'entry_time': self.Time,
@@ -314,7 +336,7 @@ class AdaptiveRSIPCAAlgorithm(QCAlgorithm):
             quantity = self.positions[ticker]
             ticket = self.MarketOrder(symbol, -quantity)
             
-            if ticket.Status == OrderStatus.Filled:
+            if ticket.Status == OrderStatus.Filled or ticket.Status == OrderStatus.PartiallyFilled:
                 # Calculate trade results
                 pnl_pct = (current_price - entry_info['entry_price']) / entry_info['entry_price'] * 100
                 duration = self.Time - entry_info['entry_time']
@@ -333,7 +355,9 @@ class AdaptiveRSIPCAAlgorithm(QCAlgorithm):
                     'vol_regime': dynamic_params['regime'],
                     'volatility_pct': dynamic_params['volatility_pct'],
                     'trailing_stop_used': dynamic_params['trailing_stop'],
-                    'position_multiplier': dynamic_params['position_multiplier']
+                    'position_multiplier': dynamic_params['position_multiplier'],
+                    'rsi_at_entry': self.indicators[ticker]['rsi'].Current.Value,
+                    'rsi_at_exit': self.indicators[ticker]['rsi'].Current.Value
                 }
                 
                 self.trade_log.append(trade_data)
@@ -392,7 +416,7 @@ class AdaptiveRSIPCAAlgorithm(QCAlgorithm):
             low_vol_wr = sum(1 for t in low_vol_trades if t['pnl_pct'] > 0) / len(low_vol_trades) * 100
             high_vol_wr = sum(1 for t in high_vol_trades if t['pnl_pct'] > 0) / len(high_vol_trades) * 100
             
-            self.Debug(f"🌡️  Volatility Analysis: Low vol: {low_vol_wr:.1f}% ({len(low_vol_trades)} trades), "
+            self.Debug(f"🌡️ Volatility Analysis: Low vol: {low_vol_wr:.1f}% ({len(low_vol_trades)} trades), "
                       f"High vol: {high_vol_wr:.1f}% ({len(high_vol_trades)} trades)")
             
             # Generate suggestions based on performance differential
@@ -424,8 +448,25 @@ class AdaptiveRSIPCAAlgorithm(QCAlgorithm):
         
         for reason, data in exit_analysis.items():
             if data['total'] >= 5:  # Minimum sample
-                win_rate = data['wins'] / data['total'] * 100
-                self.Debug(f"🚪 Exit Analysis: {reason} - {win_rate:.1f}% win rate ({data['total']} trades)")
+                win_rate_exit = data['wins'] / data['total'] * 100
+                self.Debug(f"🚪 Exit Analysis: {reason} - {win_rate_exit:.1f}% win rate ({data['total']} trades)")
+                
+                # Suggest RSI threshold adjustments
+                if reason == 'rsi_overbought':
+                    if win_rate_exit > 85 and data['total'] >= 15:
+                        # Very effective, consider lowering threshold
+                        current_threshold = self.adaptive_params['rsi_overbought_threshold']['value']
+                        suggested_threshold = max(65, current_threshold - 2)
+                        if suggested_threshold != current_threshold:
+                            self.Debug(f"💡 SUGGESTION: Lower RSI threshold from {current_threshold} to {suggested_threshold}")
+                            self.Debug(f"   Reason: RSI exit very effective ({win_rate_exit:.1f}% win rate)")
+                    elif win_rate_exit < 70 and data['total'] >= 15:
+                        # Less effective, consider raising threshold
+                        current_threshold = self.adaptive_params['rsi_overbought_threshold']['value']
+                        suggested_threshold = min(85, current_threshold + 2)
+                        if suggested_threshold != current_threshold:
+                            self.Debug(f"💡 SUGGESTION: Raise RSI threshold from {current_threshold} to {suggested_threshold}")
+                            self.Debug(f"   Reason: RSI exit underperforming ({win_rate_exit:.1f}% win rate)")
         
         self.Debug("🧠 LEARNING CYCLE COMPLETE")
 
@@ -449,11 +490,34 @@ class AdaptiveRSIPCAAlgorithm(QCAlgorithm):
             
             if low_vol_trades:
                 low_vol_wr = sum(1 for t in low_vol_trades if t['pnl_pct'] > 0) / len(low_vol_trades) * 100
-                self.Debug(f"🌤️  Low Volatility: {low_vol_wr:.1f}% win rate ({len(low_vol_trades)} trades)")
+                self.Debug(f"🌤️ Low Volatility: {low_vol_wr:.1f}% win rate ({len(low_vol_trades)} trades)")
             
             if high_vol_trades:
                 high_vol_wr = sum(1 for t in high_vol_trades if t['pnl_pct'] > 0) / len(high_vol_trades) * 100
-                self.Debug(f"⛈️  High Volatility: {high_vol_wr:.1f}% win rate ({len(high_vol_trades)} trades)")
+                self.Debug(f"⛈️ High Volatility: {high_vol_wr:.1f}% win rate ({len(high_vol_trades)} trades)")
+            
+            # Calculate total returns
+            total_pnl = sum([trade['pnl_pct'] for trade in self.trade_log])
+            self.Debug(f"💎 Total Strategy P&L: {total_pnl:+.2f}%")
+            
+            # Exit strategy effectiveness summary
+            exit_summary = {}
+            for trade in self.trade_log:
+                reason = trade['exit_reason']
+                if reason not in exit_summary:
+                    exit_summary[reason] = {'wins': 0, 'total': 0, 'pnl': 0}
+                
+                exit_summary[reason]['total'] += 1
+                exit_summary[reason]['pnl'] += trade['pnl_pct']
+                if trade['pnl_pct'] > 0:
+                    exit_summary[reason]['wins'] += 1
+            
+            self.Debug("🚪 EXIT STRATEGY SUMMARY:")
+            for reason, data in exit_summary.items():
+                if data['total'] > 0:
+                    win_rate_reason = data['wins'] / data['total'] * 100
+                    avg_pnl_reason = data['pnl'] / data['total']
+                    self.Debug(f"   {reason}: {win_rate_reason:.1f}% win rate, {avg_pnl_reason:+.2f}% avg P&L ({data['total']} trades)")
             
             self.Debug("=" * 60)
         
