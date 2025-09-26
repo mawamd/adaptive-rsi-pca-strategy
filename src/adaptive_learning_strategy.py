@@ -1,3 +1,4 @@
+import copy
 import sqlite3
 import json
 import numpy as np
@@ -351,34 +352,36 @@ class AdaptiveLearningStrategy:
             return suggestions  # Return original suggestions with warning
         
         for suggestion in suggestions:
+            suggestion_copy = copy.deepcopy(suggestion)
+
             # Split trades into training and validation sets
             training_trades = all_trades[:-self.walk_forward_window]
             validation_trades = all_trades[-self.walk_forward_window:]
-            
+
             # Simulate parameter change on validation set
             validation_score = self._simulate_parameter_change(
-                validation_trades, 
-                suggestion.parameter_name, 
-                suggestion.suggested_value
+                validation_trades,
+                suggestion_copy.parameter_name,
+                suggestion_copy.suggested_value
             )
-            
+
             # Compare with baseline (original parameter) performance
             baseline_score = self._simulate_parameter_change(
                 validation_trades,
-                suggestion.parameter_name,
-                suggestion.current_value
+                suggestion_copy.parameter_name,
+                suggestion_copy.current_value
             )
-            
+
             improvement = validation_score - baseline_score
-            
+
             # Only validate if improvement is maintained in out-of-sample data
             if improvement > self.min_effect_size:
-                suggestion.confidence *= 0.9  # Slightly reduce confidence for out-of-sample validation
-                validated_suggestions.append(suggestion)
+                suggestion_copy.confidence *= 0.9  # Slightly reduce confidence for out-of-sample validation
+                validated_suggestions.append(suggestion_copy)
             else:
                 print(f"Walk-forward validation failed for {suggestion.parameter_name}: "
                       f"improvement {improvement:.3f} < threshold {self.min_effect_size}")
-        
+
         return validated_suggestions
     
     def _simulate_parameter_change(self, trades: List, parameter_name: str, parameter_value: float) -> float:
