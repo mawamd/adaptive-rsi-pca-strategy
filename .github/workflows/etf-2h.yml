@@ -1,0 +1,54 @@
+name: ETF 2h Gainers (Alpaca SIP)
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "*/15 14-21 * * 1-5"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    env:
+      ALPACA_FEED: sip
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run script
+        env:
+          ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: |
+          python etf_2h_alpaca.py
+
+      - name: Upload 2h CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: etf_gainers_2h_csv
+          path: etf_gainers_2h.csv
+          retention-days: 5
+
+      - name: Upload hourly OHLCV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: etf_hourly_48h_csv
+          path: etf_hourly_48h.csv
+          retention-days: 5
+
+      - name: Publish Job Summary
+        run: |
+          echo "## ETF 2h Gainers Summary" >> $GITHUB_STEP_SUMMARY
+          cat SUMMARY.md >> $GITHUB_STEP_SUMMARY
